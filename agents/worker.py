@@ -17,11 +17,11 @@ class WorkerAgent:
         self.node_selection_prompt = PromptTemplate.from_template(
             "You are an expert document retrieval agent.\n"
             "Your task is to review a list of document sections (provided with their titles and summaries) "
-            "and determine which section is most likely to contain the answer to the user's query.\n\n"
+            "and determine which sections are most likely to contain the answer to the user's query.\n\n"
             "User Query: '{query}'\n\n"
             "Available Sections:\n"
             "{sections}\n\n"
-            "If one of these sections is highly relevant, return ONLY its exact 'node_id'.\n"
+            "Return the 'node_id's of up to 3 most relevant sections, ranked from most to least relevant, separated by commas.\n"
             "If none seem relevant at all, return 'NONE'.\n"
             "Do not provide any other text."
         )
@@ -32,7 +32,7 @@ class WorkerAgent:
             "Section Title: {title}\n"
             "Context Text:\n{text}\n\n"
             "User Query: {query}\n\n"
-            "If the context does not contain the answer, state that you cannot find the answer in the document."
+            "If the context does not contain the answer, return EXACTLY the phrase 'I cannot find the answer in the document.' and nothing else."
         )
 
     def _load_document_tree(self) -> List[Dict[Any, Any]]:
@@ -51,10 +51,10 @@ class WorkerAgent:
         else:
             return []
 
-    async def _evaluate_nodes(self, query: str, nodes: List[Dict]) -> Optional[str]:
-        """Uses LLM to pick the most relevant node from a list of siblings based on summaries."""
+    async def _evaluate_nodes(self, query: str, nodes: List[Dict]) -> List[str]:
+        """Uses LLM to pick the top 3 relevant nodes from a list of siblings based on summaries."""
         if not nodes:
-            return None
+            return []
             
         sections_text = ""
         for i, node in enumerate(nodes):
@@ -65,71 +65,97 @@ class WorkerAgent:
             
         chain = self.node_selection_prompt | self.routing_llm
         response = await chain.ainvoke({"query": query, "sections": sections_text})
-        selected_id = response.content.strip().strip("'").strip('"')
+        selected_text = response.content.strip().strip("'").strip('"')
         
-        if selected_id.upper() == "NONE":
-            return None
-        return selected_id
+        print(f"DEBUG _evaluate_nodes: Available IDs: {[n.get('node_id') for n in nodes]}")
+        print(f"DEBUG _evaluate_nodes: LLM selected IDs: {selected_text}")
+        
+        if selected_text.upper() == "NONE" or not selected_text:
+            return []
+            
+        # Parse comma-separated list
+        selected_ids = [s.strip() for s in selected_text.split(',') if s.strip()]
+        # Take up to 3
+        return selected_ids[:3]
 
-    async def _recursive_search(self, query: str, current_nodes: List[Dict]) -> Optional[Dict]:
+    async def _recursive_search(self, query: str, current_nodes: List[Dict]) -> List[Dict]:
         """
-        Recursively searches the tree. At each level, evaluates siblings to pick the best path.
-        If the chosen node has children, it drills down. If not, it returns that node.
+        Recursively searches the tree. At each level, evaluates siblings to pick the top paths.
+        If a chosen node has children, it drills down. If not, it returns that node.
+        Returns a list of candidate nodes ranked by relevance.
         """
         if not current_nodes:
-            return None
+            return []
 
-        # 1. Evaluate current level
-        best_node_id = await self._evaluate_nodes(query, current_nodes)
+        # 1. Evaluate current level to get top IDs
+        best_node_ids = await self._evaluate_nodes(query, current_nodes)
         
-        if not best_node_id:
-            return None
+        if not best_node_ids:
+            return []
 
-        # 2. Find the selected node object (safely comparing as strings)
-        selected_node = next((n for n in current_nodes if str(n.get("node_id")) == best_node_id), None)
-        
-        if not selected_node:
-            # Fallback if LLM hallucinated an ID
-            return None
+        candidates = []
+        for node_id in best_node_ids:
+            # 2. Find the selected node object (safely comparing as strings)
+            selected_node = next((n for n in current_nodes if str(n.get("node_id")) == node_id), None)
             
-        # 3. If it has children, recurse deeper. Otherwise, we found our leaf/target.
-        children = selected_node.get("nodes", [])
-        if children and len(children) > 0:
-            # Check if children have the answer. If children yield nothing, return the parent.
-            deep_result = await self._recursive_search(query, children)
-            if deep_result:
-                return deep_result
+            if not selected_node:
+                # Fallback if LLM hallucinated an ID
+                continue
+                
+            # 3. If it has children, recurse deeper. Otherwise, we found a leaf/target.
+            children = selected_node.get("nodes", [])
+            if children and len(children) > 0:
+                deep_results = await self._recursive_search(query, children)
+                if deep_results:
+                    candidates.extend(deep_results)
+                else:
+                    # If children yielded nothing, fallback to the parent node
+                    candidates.append(selected_node)
             else:
-                return selected_node
-        else:
-            return selected_node
+                candidates.append(selected_node)
+                
+        return candidates
 
     async def search_and_answer(self, query: str) -> str:
         """Main entry point for document retrieval and answering."""
         if not self.document_tree:
             return "The document tree is empty or could not be loaded."
             
-        # Traverse the tree asynchronously
-        best_node = await self._recursive_search(query, self.document_tree)
+        # Traverse the tree asynchronously to get candidate nodes
+        candidate_nodes = await self._recursive_search(query, self.document_tree)
         
-        if not best_node:
+        if not candidate_nodes:
             return "I could not find a relevant section in the document to answer your query."
             
-        # We need the full text of the node to generate the answer
-        title = best_node.get("title", "Unknown Section")
-        text = best_node.get("text", "")
+        print(f"DEBUG search_and_answer: Found {len(candidate_nodes)} candidate nodes to evaluate.")
         
-        # In PageIndex, sometimes parents don't have direct 'text' if all text is in children.
-        # If 'text' is missing, fallback to the summary or concatenate child text (simplified here to just use summary)
-        if not text.strip():
-            text = best_node.get("summary", "No detailed text available.")
+        for i, node in enumerate(candidate_nodes):
+            title = node.get("title", "Unknown Section")
+            text = node.get("text", "")
             
-        # Generate the final answer
-        chain = self.answer_generation_prompt | self.answering_llm
-        final_response = await chain.ainvoke({
-            "title": title,
-            "text": text,
-            "query": query
-        })
-        
-        return final_response.content
+            # In PageIndex, sometimes parents don't have direct 'text' if all text is in children.
+            if not text.strip():
+                text = node.get("summary", "No detailed text available.")
+                
+            print(f"DEBUG search_and_answer: Evaluating Candidate {i+1}/{len(candidate_nodes)}")
+            print(f"DEBUG search_and_answer: Node Title: {title}, Node ID: {node.get('node_id')}")
+            
+            # Generate the final answer
+            chain = self.answer_generation_prompt | self.answering_llm
+            final_response = await chain.ainvoke({
+                "title": title,
+                "text": text,
+                "query": query
+            })
+            
+            answer = final_response.content.strip()
+            
+            # Check if answering LLM failed to find the answer
+            if answer == "I cannot find the answer in the document.":
+                print(f"DEBUG search_and_answer: Candidate {i+1} failed to answer the query. Moving to next candidate.")
+                continue
+            else:
+                print(f"DEBUG search_and_answer: Candidate {i+1} successfully answered the query!")
+                return answer
+                
+        return "I cannot find the answer in the document."
