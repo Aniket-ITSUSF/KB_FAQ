@@ -14,16 +14,21 @@ class WorkerAgent:
         self.json_path = json_path
         
         self.node_selection_prompt = PromptTemplate.from_template(
-            "You are an expert document retrieval agent.\n"
-            "Your task is to review a list of document sections (provided with their titles and summaries) "
-            "and determine which sections are most likely to contain the answer to the user's query.\n\n"
-            "Chat History / Context: {history}\n\n"
-            "User Query: '{query}'\n\n"
-            "Available Sections:\n"
-            "{sections}\n\n"
-            "Return the 'node_id's of up to 3 most relevant sections, ranked from most to least relevant, separated by commas.\n"
-            "If none seem relevant at all, return 'NONE'.\n"
-            "Do not provide any other text."
+            "You are an expert financial and legal routing agent specializing in SEC 10-K filings.\n"
+            "Your task is to analyze the user's query and select the most relevant sections of the document to search for the answer.\n\n"
+            "Use the following SEC 10-K domain knowledge to guide your selection:\n\n"
+            "\"Cover Page\" or \"Preface\": Contains outstanding shares and the aggregate market value of voting stock.\n\n"
+            "\"Item 1. Business\": Contains general product descriptions, corporate strategy, and employee headcounts.\n\n"
+            "\"Item 1A. Risk Factors\": Contains potential threats, macroeconomic risks, and supply chain vulnerabilities.\n\n"
+            "\"Item 3. Legal Proceedings\": Contains lawsuits, regulatory investigations, government fines, and antitrust actions (e.g., DOJ, European Commission).\n\n"
+            "\"Item 5. Market for Registrant's Common Equity\": Contains stock performance and share repurchase program announcements.\n\n"
+            "\"Item 7. Management's Discussion and Analysis (MD&A)\": Contains specific net sales numbers, product announcements, gross margins, and year-over-year financial comparisons.\n\n"
+            "\"Item 8. Financial Statements and Supplementary Data\": Contains raw balance sheets, income statements, and deep tax notes.\n\n"
+            "Based on the user's query, the domain knowledge above, and the provided node summaries, determine the top 5 most likely nodes that contain the answer.\n\n"
+            "Available Nodes:\n"
+            "{node_summaries}\n\n"
+            "User Query: {query}\n\n"
+            "Return ONLY a comma-separated list of the top 5 most relevant node_ids, ranked from highest to lowest probability. Do not output any other text or explanation."
         )
         
         self.answer_generation_prompt = PromptTemplate.from_template(
@@ -51,28 +56,47 @@ class WorkerAgent:
         else:
             return []
 
+    def _get_all_text(self, node: Dict[Any, Any]) -> str:
+        """Recursively gathers text from a node and all descendants."""
+        text_chunks: List[str] = []
+
+        node_text = node.get("text", "")
+        if isinstance(node_text, str) and node_text.strip():
+            text_chunks.append(node_text.strip())
+
+        children = node.get("nodes", [])
+        if isinstance(children, list):
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_text = self._get_all_text(child)
+                if child_text.strip():
+                    text_chunks.append(child_text)
+
+        return "\n\n".join(text_chunks)
+
     async def _evaluate_nodes(self, query: str, history: str, nodes: List[Dict]) -> List[str]:
-        """Uses LLM to pick the top 3 relevant nodes from a list of siblings based on summaries."""
+        """Uses LLM to pick the top 5 relevant nodes from a list of siblings based on summaries."""
         if not nodes:
             return []
             
-        sections_text = ""
+        node_summaries_text = ""
         for i, node in enumerate(nodes):
             node_id = node.get("node_id", f"missing_id_{i}")
             title = node.get("title", "Untitled")
             summary = node.get("summary", "No summary available.")
-            sections_text += f"- node_id: {node_id}\n  Title: {title}\n  Summary: {summary}\n\n"
+            node_summaries_text += f"- node_id: {node_id}\n  Title: {title}\n  Summary: {summary}\n\n"
             
         chain = self.node_selection_prompt | self.routing_llm
-        response = await chain.ainvoke({"query": query, "history": history, "sections": sections_text})
+        response = await chain.ainvoke({"query": query, "node_summaries": node_summaries_text})
         selected_text = response.content.strip().strip("'").strip('"')
         
         if selected_text.upper() == "NONE" or not selected_text:
             return []
             
         # Parse comma-separated list
-        selected_ids = [s.strip() for s in selected_text.split(',') if s.strip()]
-        return selected_ids[:3]
+        selected_ids = [s.strip().strip("'").strip('"') for s in selected_text.split(',') if s.strip()]
+        return selected_ids[:5]
 
     async def _recursive_search(self, query: str, history: str, current_nodes: List[Dict], yield_func) -> List[Dict]:
         if not current_nodes:
@@ -144,7 +168,7 @@ class WorkerAgent:
         
         for i, node in enumerate(candidates):
             title = node.get("title", "Unknown Section")
-            text = node.get("text", "")
+            text = self._get_all_text(node)
             
             if not text.strip():
                 text = node.get("summary", "No detailed text available.")
