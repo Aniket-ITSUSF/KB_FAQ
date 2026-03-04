@@ -37,21 +37,27 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
             else:
                 messages = [{"role": "user", "content": prompt}]
             
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
+            kwargs = {
+                "model": model,
+                "messages": messages,
+            }
+            if any(m in model.lower() for m in ["o1", "o3", "gpt-5"]):
+                kwargs["temperature"] = 1
+            else:
+                kwargs["temperature"] = 0
+                
+            response = client.chat.completions.create(**kwargs)
             if response.choices[0].finish_reason == "length":
                 return response.choices[0].message.content, "max_output_reached"
             else:
                 return response.choices[0].message.content, "finished"
 
         except Exception as e:
-            print('************* Retrying *************')
+            wait_time = 2 ** i + 1  # Exponential backoff: 2, 3, 5, 9...
+            print(f'************* Retrying in {wait_time}s *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
+                time.sleep(wait_time)  # Wait with exponential backoff before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 return "Error"
@@ -69,18 +75,24 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
             else:
                 messages = [{"role": "user", "content": prompt}]
             
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
+            kwargs = {
+                "model": model,
+                "messages": messages,
+            }
+            if any(m in model.lower() for m in ["o1", "o3", "gpt-5"]):
+                kwargs["temperature"] = 1
+            else:
+                kwargs["temperature"] = 0
+                
+            response = client.chat.completions.create(**kwargs)
    
             return response.choices[0].message.content
         except Exception as e:
-            print('************* Retrying *************')
+            wait_time = 2 ** i + 1  # Exponential backoff: 2, 3, 5, 9...
+            print(f'************* Retrying in {wait_time}s *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
+                time.sleep(wait_time)  # Wait with exponential backoff before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 return "Error"
@@ -92,17 +104,23 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
     for i in range(max_retries):
         try:
             async with openai.AsyncOpenAI(api_key=api_key) as client:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0,
-                )
+                kwargs = {
+                    "model": model,
+                    "messages": messages,
+                }
+                if any(m in model.lower() for m in ["o1", "o3", "gpt-5"]):
+                    kwargs["temperature"] = 1
+                else:
+                    kwargs["temperature"] = 0
+                    
+                response = await client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content
         except Exception as e:
-            print('************* Retrying *************')
+            wait_time = 2 ** i + 1
+            print(f'************* Retrying in {wait_time}s *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
-                await asyncio.sleep(1)  # Wait for 1s before retrying
+                await asyncio.sleep(wait_time)  # Wait with exponential backoff before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 return "Error"  
